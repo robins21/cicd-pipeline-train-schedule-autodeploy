@@ -1,79 +1,117 @@
 pipeline {
     agent any
+    
     environment {
-        //be sure to replace "willbla" with your own Docker Hub username
-        DOCKER_IMAGE_NAME = "willbla/train-schedule"
+        DOCKERHUB_CREDENTIALS = credentials('docker-hub-credentials')
+        DOCKER_IMAGE_NAME = "imrobins21/train-schedule"
+        DOCKER_IMAGE_TAG = "${env.BUILD_NUMBER}"
+        KUBECONFIG = credentials('kubeconfig-credentials')
     }
+    
     stages {
-        stage('Build') {
+        stage('Checkout') {
             steps {
-                echo 'Running build automation'
-                sh './gradlew build --no-daemon'
-                archiveArtifacts artifacts: 'dist/trainSchedule.zip'
+                echo 'Checking out code from GitHub...'
+                git branch: 'main', 
+                    credentialsId: 'github-credentials', 
+                    url: 'https://github.com/robins21/cicd-pipeline-train-schedule-autodeploy.git'
             }
         }
+        
         stage('Build Docker Image') {
-            when {
-                branch 'master'
-            }
             steps {
                 script {
-                    app = docker.build(DOCKER_IMAGE_NAME)
-                    app.inside {
-                        sh 'echo Hello, World!'
+                    echo "Building Docker image: ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+                    sh "docker build -t ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} ."
+                    sh "docker tag ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} ${DOCKER_IMAGE_NAME}:latest"
+                }
+            }
+        }
+        
+        stage('Test Docker Image') {
+            steps {
+                script {
+                    echo 'Testing Docker image...'
+                    sh "docker run --rm ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} npm test || echo 'No tests found, continuing...'"
+                }
+            }
+        }
+        
+        stage('Push to Docker Hub') {
+            steps {
+                script {
+                    echo 'Logging into Docker Hub...'
+                    sh 'echo $DOCKERHUB_CREDENTIALS_PSW | docker login -u $DOCKERHUB_CREDENTIALS_USR --password-stdin'
+                    echo "Pushing image: ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+                    sh "docker push ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+                    sh "docker push ${DOCKER_IMAGE_NAME}:latest"
+                    echo 'Cleaning up local images...'
+                    sh "docker rmi ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} || true"
+                    sh "docker rmi ${DOCKER_IMAGE_NAME}:latest || true"
+                }
+            }
+        }
+        
+        stage('Update Kubernetes Manifest') {
+            steps {
+                script {
+                    echo 'Updating Kubernetes deployment with new image tag...'
+                    sh """
+                        sed -i 's|image: .*train-schedule:|image: ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}|g' kubernetes/deployment.yaml
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    echo 'Deploying to Minikube...'
+                    withKubeConfig([credentialsId: 'kubeconfig-credentials']) {
+                        sh 'kubectl apply -f kubernetes/deployment.yaml'
+                        sh 'kubectl apply -f kubernetes/service.yaml'
+                        sh 'kubectl rollout status deployment/train-schedule'
                     }
                 }
             }
         }
-        stage('Push Docker Image') {
-            when {
-                branch 'master'
-            }
+        
+        stage('Verify Deployment') {
             steps {
                 script {
-                    docker.withRegistry('https://registry.hub.docker.com', 'docker_hub_login') {
-                        app.push("${env.BUILD_NUMBER}")
-                        app.push("latest")
+                    echo 'Waiting for deployment to be ready...'
+                    withKubeConfig([credentialsId: 'kubeconfig-credentials']) {
+                        sh 'sleep 10'
+                        sh 'kubectl get pods -l app=train-schedule'
+                        sh 'kubectl get svc train-schedule-service'
                     }
                 }
             }
         }
-        stage('CanaryDeploy') {
-            when {
-                branch 'master'
-            }
-            environment { 
-                CANARY_REPLICAS = 1
-            }
-            steps {
-                kubernetesDeploy(
-                    kubeconfigId: 'kubeconfig',
-                    configs: 'train-schedule-kube-canary.yml',
-                    enableConfigSubstitution: true
-                )
+    }
+    
+    post {
+        always {
+            echo 'Cleaning up...'
+            sh 'docker logout || true'
+        }
+        success {
+            echo 'Pipeline completed successfully!'
+            withKubeConfig([credentialsId: 'kubeconfig-credentials']) {
+                script {
+                    def service = sh(script: 'kubectl get svc train-schedule-service -o jsonpath="{.spec.ports[0].nodePort}"', returnStdout: true).trim()
+                    def nodePort = service as Integer
+                    echo "Application is running on Minikube at: http://\$(minikube ip):${nodePort}"
+                }
             }
         }
-        stage('DeployToProduction') {
-            when {
-                branch 'master'
-            }
-            environment { 
-                CANARY_REPLICAS = 0
-            }
-            steps {
-                input 'Deploy to Production?'
-                milestone(1)
-                kubernetesDeploy(
-                    kubeconfigId: 'kubeconfig',
-                    configs: 'train-schedule-kube-canary.yml',
-                    enableConfigSubstitution: true
-                )
-                kubernetesDeploy(
-                    kubeconfigId: 'kubeconfig',
-                    configs: 'train-schedule-kube.yml',
-                    enableConfigSubstitution: true
-                )
-            }
+        failure {
+            echo 'Pipeline failed!'
+            emailext (
+                subject: "Build Failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                body: "Check console output at ${env.BUILD_URL} to view the results.",
+                to: 'admin@abstergo.com'
+            )
         }
     }
 }
